@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F  # F를 가져오는 부분 추가
+import torch.nn.functional as F
 import numpy as np
 from torch.optim import lr_scheduler
 from torch.utils.data import DataLoader, Dataset 
@@ -49,13 +49,6 @@ joint_texts = torch.cat([clip.tokenize(f"a photo with {c} quality") for c in qua
 IMG_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.ppm', '.bmp', '.pgm', '.tif']
 
 def has_file_allowed_extension(filename, extensions):
-    """Checks if a file is an allowed extension.
-    Args:
-        filename (string): path to a file
-        extensions (iterable of strings): extensions to consider (lowercase)
-    Returns:
-        bool: True if the filename ends with one of given extensions
-    """
     filename_lower = filename.lower()
     return any(filename_lower.endswith(ext) for ext in extensions)
 
@@ -73,7 +66,7 @@ def get_default_img_loader():
 
 class ImageDataset(Dataset):
     def __init__(self, csv_file, img_dir, preprocess, num_patch, test, get_loader=get_default_img_loader):
-        self.data = pd.read_csv(csv_file, sep=',', header=0)  # 수정된 부분: CSV 파일의 구분자 확인
+        self.data = pd.read_csv(csv_file, sep=',', header=0)
         print(f'{len(self.data)} csv data successfully loaded!')
         self.img_dir = img_dir
         self.loader = get_loader()
@@ -340,7 +333,10 @@ def train(model, best_result, best_epoch, srcc_dict):
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'all_results': all_result
+                'all_results': all_result,
+                'best_result': best_result,  # 추가된 부분
+                'best_epoch': best_epoch,    # 추가된 부분
+                'srcc_dict': srcc_dict       # 추가된 부분
             }, ckpt_name)
 
     return best_result, best_epoch, srcc_dict, all_result
