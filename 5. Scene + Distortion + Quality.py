@@ -44,13 +44,14 @@ bs = 64
 
 train_patch = 3
 
-loss_quality = Fidelity_Loss()
+loss_img2 = Fidelity_Loss_distortion()
 loss_scene = Multi_Fidelity_Loss()
-loss_distortion = Fidelity_Loss_distortion()
 
 joint_texts_quality = torch.cat([clip.tokenize(f"a photo with {c} quality") for c in qualitys]).to(device)
 joint_texts_scene = torch.cat([clip.tokenize(f"a photo of a {c}") for c in scenes]).to(device)
 joint_texts_distortion = torch.cat([clip.tokenize(f"a photo with {c} artifacts") for c in distortions]).to(device)
+
+joint_texts_combined = torch.cat([joint_texts_quality, joint_texts_scene, joint_texts_distortion])
 
 IMG_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.ppm', '.bmp', '.pgm', '.tif']
 
@@ -203,17 +204,19 @@ def evaluate_model(loader, phase, dataset, joint_texts):
         x = x.to(device)
         q_mos = q_mos + gmos.cpu().tolist()
 
+        # Calculate features
         with torch.no_grad():
             logits_per_image, _ = do_batch(x, joint_texts)
 
-        logits_per_image = logits_per_image.view(-1, len(qualitys))
+        logits_per_image = logits_per_image.view(-1, len(qualitys) + len(scenes) + len(distortions))
 
-        logits_quality = logits_per_image
+        logits_combined = logits_per_image
 
-        quality_preds = 1 * logits_quality[:, 0] + 2 * logits_quality[:, 1] + 3 * logits_quality[:, 2] + \
-                        4 * logits_quality[:, 3] + 5 * logits_quality[:, 4]
+        combined_preds = (1 * logits_combined[:, 0:len(qualitys)].sum(dim=1) + 
+                          2 * logits_combined[:, len(qualitys):len(qualitys) + len(scenes)].sum(dim=1) + 
+                          3 * logits_combined[:, -len(distortions):].sum(dim=1))
 
-        q_hat = q_hat + quality_preds.cpu().tolist()
+        q_hat = q_hat + combined_preds.cpu().tolist()
 
     srcc = scipy.stats.mstats.spearmanr(x=q_mos, y=q_hat)[0]
 
@@ -234,9 +237,7 @@ def train(model, best_result, best_epoch, srcc_dict):
     for loader in train_loaders:
         loaders.append(iter(loader))
 
-    joint_texts_quality = torch.cat([clip.tokenize(f"a photo with {c} quality") for c in qualitys]).to(device)
-    joint_texts_scene = torch.cat([clip.tokenize(f"a photo of a {c}") for c in scenes]).to(device)
-    joint_texts_distortion = torch.cat([clip.tokenize(f"a photo with {c} artifacts") for c in distortions]).to(device)
+    joint_texts = joint_texts_combined.to(device)
 
     print(optimizer.state_dict()['param_groups'][0]['lr'])
     if optimizer.state_dict()['param_groups'][0]['lr'] == 0:
@@ -262,28 +263,22 @@ def train(model, best_result, best_epoch, srcc_dict):
             gmos_batch.append(gmos)
             num_sample_per_task.append(x.size(0))
 
+            # preserve all samples into a batch
             all_batch.append(x)
 
         all_batch = torch.cat(all_batch, dim=0)
         gmos_batch = torch.cat(gmos_batch, dim=0)
 
         optimizer.zero_grad()
-        logits_per_image_quality, _ = do_batch(all_batch, joint_texts_quality)
-        logits_per_image_scene, _ = do_batch(all_batch, joint_texts_scene)
-        logits_per_image_distortion, _ = do_batch(all_batch, joint_texts_distortion)
+        logits_per_image, _ = do_batch(all_batch, joint_texts)
 
-        logits_per_image_quality = logits_per_image_quality.view(-1, len(qualitys))
-        logits_per_image_scene = logits_per_image_scene.view(-1, len(scenes))
-        logits_per_image_distortion = logits_per_image_distortion.view(-1, len(distortions))
+        logits_per_image = logits_per_image.view(-1, len(qualitys) + len(scenes) + len(distortions))
 
-        logits_quality = 1 * logits_per_image_quality[:, 0] + 2 * logits_per_image_quality[:, 1] + 3 * logits_per_image_quality[:, 2] + \
-                         4 * logits_per_image_quality[:, 3] + 5 * logits_per_image_quality[:, 4]
+        combined_preds = (1 * logits_per_image[:, 0:len(qualitys)].sum(dim=1) + 
+                          2 * logits_per_image[:, len(qualitys):len(qualitys) + len(scenes)].sum(dim=1) + 
+                          3 * logits_per_image[:, -len(distortions):].sum(dim=1))
 
-        total_loss_quality = loss_m4(logits_quality, num_sample_per_task, gmos_batch.detach()).mean()
-        total_loss_scene = loss_m4(logits_per_image_scene, num_sample_per_task, gmos_batch.detach()).mean()
-        total_loss_distortion = loss_m4(logits_per_image_distortion, num_sample_per_task, gmos_batch.detach()).mean()
-
-        total_loss = total_loss_quality + total_loss_scene + total_loss_distortion
+        total_loss = loss_m4(combined_preds, num_sample_per_task, gmos_batch.detach()).mean()
 
         total_loss.backward()
 
@@ -294,6 +289,7 @@ def train(model, best_result, best_epoch, srcc_dict):
             optimizer.step()
             clip.model.convert_weights(model)
 
+        # statistics
         running_loss = beta * running_loss + (1 - beta) * total_loss.data.item()
         loss_corrected = running_loss / (1 - beta ** local_counter)
 
@@ -314,15 +310,10 @@ def train(model, best_result, best_epoch, srcc_dict):
     all_result = {'val': {}, 'test': {}}
     if epoch >= 0:
 
-        srcc_quality_val = evaluate_model(koniq10k_val_loader, phase='val', dataset='koniq10k', joint_texts=joint_texts_quality)
-        srcc_scene_val = evaluate_model(koniq10k_val_loader, phase='val', dataset='koniq10k', joint_texts=joint_texts_scene)
-        srcc_distortion_val = evaluate_model(koniq10k_val_loader, phase='val', dataset='koniq10k', joint_texts=joint_texts_distortion)
+        srcc1 = evaluate_model(koniq10k_val_loader, phase='val', dataset='koniq10k', joint_texts=joint_texts)
+        srcc11 = evaluate_model(koniq10k_test_loader, phase='test', dataset='koniq10k', joint_texts=joint_texts)
 
-        srcc_quality_test = evaluate_model(koniq10k_test_loader, phase='test', dataset='koniq10k', joint_texts=joint_texts_quality)
-        srcc_scene_test = evaluate_model(koniq10k_test_loader, phase='test', dataset='koniq10k', joint_texts=joint_texts_scene)
-        srcc_distortion_test = evaluate_model(koniq10k_test_loader, phase='test', dataset='koniq10k', joint_texts=joint_texts_distortion)
-
-        srcc_avg = (srcc_quality_val + srcc_scene_val + srcc_distortion_val) / 3
+        srcc_avg = srcc1
 
         current_avg = srcc_avg
 
@@ -330,14 +321,13 @@ def train(model, best_result, best_epoch, srcc_dict):
             print('**********New overall best!**********')
             best_epoch['avg'] = epoch
             best_result['avg'] = current_avg
-            srcc_dict['koniq10k_quality'] = srcc_quality_test
-            srcc_dict['koniq10k_scene'] = srcc_scene_test
-            srcc_dict['koniq10k_distortion'] = srcc_distortion_test
+            srcc_dict['koniq10k'] = srcc11
 
+            # Check if the directory exists, if not, create it
             checkpoint_dir = os.path.join('checkpoints', str(session + 1))
             os.makedirs(checkpoint_dir, exist_ok=True)
 
-            ckpt_name = os.path.join(checkpoint_dir, 'liqe_scene_distortion_quality.pt')
+            ckpt_name = os.path.join(checkpoint_dir, 'liqe_qsd.pt')
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
@@ -351,30 +341,32 @@ def train(model, best_result, best_epoch, srcc_dict):
     return best_result, best_epoch, srcc_dict, all_result
 
 def evaluate_and_print_results(model, train_loader, val_loader, test_loader, best_result, best_epoch, srcc_dict):
-    srcc_quality_val = evaluate_model(val_loader, phase='val', dataset='koniq10k', joint_texts=joint_texts_quality)
-    srcc_scene_val = evaluate_model(val_loader, phase='val', dataset='koniq10k', joint_texts=joint_texts_scene)
-    srcc_distortion_val = evaluate_model(val_loader, phase='val', dataset='koniq10k', joint_texts=joint_texts_distortion)
-
-    srcc_quality_test = evaluate_model(test_loader, phase='test', dataset='koniq10k', joint_texts=joint_texts_quality)
-    srcc_scene_test = evaluate_model(test_loader, phase='test', dataset='koniq10k', joint_texts=joint_texts_scene)
-    srcc_distortion_test = evaluate_model(test_loader, phase='test', dataset='koniq10k', joint_texts=joint_texts_distortion)
-
+    # 평가
+    srcc_quality_val = eval(val_loader, phase='val', dataset='koniq10k', joint_texts=joint_texts_quality)
+    srcc_quality_test = eval(test_loader, phase='test', dataset='koniq10k', joint_texts=joint_texts_quality)
+    srcc_scene_val = eval(val_loader, phase='val', dataset='koniq10k', joint_texts=joint_texts_scene)
+    srcc_scene_test = eval(test_loader, phase='test', dataset='koniq10k', joint_texts=joint_texts_scene)
+    srcc_distortion_val = eval(val_loader, phase='val', dataset='koniq10k', joint_texts=joint_texts_distortion)
+    srcc_distortion_test = eval(test_loader, phase='test', dataset='koniq10k', joint_texts=joint_texts_distortion)
+    
+    # 평균 SRCC 계산
     srcc_avg = (srcc_quality_val + srcc_scene_val + srcc_distortion_val) / 3
     
+    # 결과를 표로 출력
     table = PrettyTable()
-    table.field_names = ["Task Combination", "SRCC Quality", "SRCC Scene", "SRCC Distortion"]
+    table.field_names = ["Task Combination", "SRCC", "ACC_s", "ACC_d"]
 
     table.add_row(["Quality", f"{srcc_quality_test:.3f}", "-", "-"])
     table.add_row(["Scene", "-", f"{srcc_scene_test:.3f}", "-"])
     table.add_row(["Distortion", "-", "-", f"{srcc_distortion_test:.3f}"])
     table.add_row(["Quality + Scene", f"{srcc_quality_test:.3f}", f"{srcc_scene_test:.3f}", "-"])
     table.add_row(["Quality + Distortion", f"{srcc_quality_test:.3f}", "-", f"{srcc_distortion_test:.3f}"])
-    table.add_row(["Scene + Distortion", "-", f"{srcc_scene_test:.3f}", f"{srcc_distortion_test:.3f}"])
     table.add_row(["All Tasks (LIQE)", f"{srcc_avg:.3f}", f"{srcc_scene_test:.3f}", f"{srcc_distortion_test:.3f}"])
 
     print(table)
 
     return best_result, best_epoch, srcc_dict
+
 
 if __name__ == '__main__':
     num_workers = 8
@@ -392,14 +384,12 @@ if __name__ == '__main__':
 
         freeze_model(opt)
 
+        # best_result와 best_epoch 초기화 수정
         best_result = {'avg': 0.0}
         best_epoch = {'avg': 0}
 
-        srcc_dict = {
-            'koniq10k_quality': 0.0,
-            'koniq10k_scene': 0.0,
-            'koniq10k_distortion': 0.0
-        }
+        # avg
+        srcc_dict = {'koniq10k': 0.0}
 
         koniq10k_train_csv = os.path.join('C:/Users/IIPL02/Desktop/LIQE/LIQE/IQA_Database/koniq-10k/meta_info_KonIQ10kDataset.csv')
         koniq10k_val_csv = os.path.join('C:/Users/IIPL02/Desktop/LIQE/LIQE/IQA_Database/koniq-10k/meta_info_KonIQ10kDataset.csv')
@@ -428,6 +418,7 @@ if __name__ == '__main__':
                 print_text = dataset + ':' + 'srcc: {}'.format(srcc_dict[dataset])
                 print(print_text)
 
+        # 최종 결과 출력
         evaluate_and_print_results(model, koniq10k_train_loader, koniq10k_val_loader, koniq10k_test_loader, best_result, best_epoch, srcc_dict)
 
         pkl_name = os.path.join('checkpoints', str(session + 1), 'all_results.pkl')
